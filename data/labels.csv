@@ -1,0 +1,12 @@
+video_id,type,drop_frame
+run01,failure,155
+run02,normal,
+run03,normal,
+run04,normal,
+run05,normal,
+run06,normal,
+run07,normal,
+run08,failure,98
+run09,failure,0
+run10,failure,141
+run12,normal,
