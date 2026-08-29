@@ -204,7 +204,7 @@ def main():
         traj, fps = load_trajectory(video_id)
 
         dev = deviation_series(traj, mu, sigma)
-        dev_alerts = sustained_rise_alerts(dev, z_threshold=2.0)
+        dev_alerts = sustained_rise_alerts(dev, z_threshold=15.0)
 
         grip = grip_spread_series(traj)
         grip_alerts = sustained_rise_alerts(grip)
