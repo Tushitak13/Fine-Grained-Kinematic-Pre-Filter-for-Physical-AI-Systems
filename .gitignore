@@ -1,1 +1,6 @@
-ÿþ
+data/raw/*.mp4
+venv/
+__pycache__/
+*.pyc
+.env
+
