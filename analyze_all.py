@@ -1,29 +1,10 @@
-"""
-Final analysis pipeline.
-
-Reads: data/labels.csv, data/trajectories/*.npy, data/trajectories/*_fps.txt
-       (all produced earlier by label_helper.py + extract_trajectory.py)
-
-Does:
-  1. Builds the reference "normal" profile from trajectories labeled `normal`
-     (excluding whichever you're holding out for the demo)
-  2. Scores every video with two signals:
-       - trajectory deviation vs reference (DTW + z-score)
-       - grip spread (thumb-to-fingertip distance)
-  3. Combines both into one alert stream using the sustained-trend rule
-  4. Validates: for failure videos, computes lead time vs the labeled drop_frame.
-     For normal videos, counts false alarms.
-  5. Prints the summary numbers to use in your pitch.
-
-Run once, after all videos are labeled and extracted:
-    python analyze_all.py
-"""
-
 import os
 import csv
 import numpy as np
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
+
+from kinematics import compute_kinematics
 
 LABELS_CSV = "data/labels.csv"
 TRAJ_DIR = "data/trajectories"
@@ -78,19 +59,19 @@ def resample(traj, target_len=TARGET_LEN):
 
 def build_reference(rows):
     normal_trajs = []
+    durations_seconds = []
     for row in rows:
         if (row["type"] == "normal"
                 and row["video_id"] not in HELD_OUT
                 and row["video_id"] not in REFERENCE_EXCLUDE):
-            traj, _ = load_trajectory(row["video_id"])
+            traj, fps = load_trajectory(row["video_id"])
             normal_trajs.append(resample(traj))
+            durations_seconds.append(len(traj) / fps)
     stacked = np.stack(normal_trajs)
     mu = stacked.mean(axis=0)
-    # Floor sigma at 0.01 (not 1e-6) — coordinates are normalized to roughly
-    # [0,1], so a near-zero sigma at low-variance reference points otherwise
-    # makes the z-score wildly hypersensitive to tiny, harmless differences.
     sigma = np.maximum(stacked.std(axis=0), 0.01)
-    return mu, sigma
+    avg_duration_seconds = float(np.mean(durations_seconds))
+    return mu, sigma, avg_duration_seconds
 
 
 def deviation_series(traj, mu, sigma):
@@ -116,6 +97,21 @@ def grip_spread_series(traj):
         dists = [np.linalg.norm(thumb_tip - lm[i]) for i in (8, 12, 16, 20)]
         scores.append(np.mean(dists))
     return np.array(scores)
+
+
+# ---------- signal 3: jerk (rate of change of acceleration) ----------
+
+def jerk_series(traj, fps):
+    """
+    Real kinematic quantity, computed via finite differences using the
+    video's actual fps. See kinematics.py for the full derivation
+    (position -> velocity -> acceleration -> jerk). Jerk magnitude is a
+    physically meaningful "suddenness" signal, distinct from positional
+    deviation -- a fast slip can spike jerk before it accumulates much
+    positional deviation.
+    """
+    kin = compute_kinematics(traj, fps)
+    return kin["jerk_mag"]
 
 
 # ---------- shared trend/alarm rule ----------
@@ -172,7 +168,22 @@ def first_true(bool_list):
 
 def main():
     rows = load_labels()
-    mu, sigma = build_reference(rows)
+    mu, sigma, avg_duration_seconds = build_reference(rows)
+
+    # Save the real reference so the Streamlit app and live demo window
+    # can use it instead of falling back to synthetic data. Also save the
+    # average REAL DURATION (seconds) of the reference videos -- the live
+    # tracker uses this to align by elapsed time, not raw frame count,
+    # since a live webcam frame index doesn't correspond 1:1 to the
+    # resampled 100-frame reference otherwise.
+    os.makedirs("data/reference_runs", exist_ok=True)
+    np.save("data/reference_runs/envelope_mean.npy", mu)
+    np.save("data/reference_runs/envelope_std.npy", sigma)
+    with open("data/reference_runs/avg_duration_seconds.txt", "w") as f:
+        f.write(str(avg_duration_seconds))
+    print(f"Saved real reference envelope to data/reference_runs/ "
+          f"(avg reference duration: {avg_duration_seconds:.2f}s)\n")
+
     ref_count = sum(
         1 for r in rows
         if r["type"] == "normal"
@@ -182,14 +193,35 @@ def main():
     print(f"Reference built from {ref_count} normal videos "
           f"(excluded from reference: {sorted(REFERENCE_EXCLUDE)}).\n")
 
-    print("--- dev score distributions (for threshold calibration) ---")
+    print("--- dev / jerk score distributions (for threshold calibration) ---")
+    print("(jerk stats below EXCLUDE the warmup period, and for failure videos")
+    print(" also show a window right before the drop frame, to test whether")
+    print(" jerk actually spikes at the failure moment specifically)\n")
     for row in rows:
         video_id = row["video_id"]
         if video_id in HELD_OUT:
             continue
         traj, fps = load_trajectory(video_id)
         dev = deviation_series(traj, mu, sigma)
-        print(f"{video_id:8} [{row['type']:8}] dev: mean={dev.mean():.2f} max={dev.max():.2f} p90={np.percentile(dev,90):.2f}")
+        jerk = jerk_series(traj, fps)
+
+        # Exclude warmup period from these stats -- the initial reach-in
+        # motion at the start of every clip is naturally jerky and isn't
+        # a failure signal, so including it confounds the comparison.
+        jerk_post_warmup = jerk[WARMUP_FRAMES:]
+
+        print(f"{video_id:8} [{row['type']:8}] "
+              f"dev: mean={dev.mean():.2f} max={dev.max():.2f} p90={np.percentile(dev,90):.2f}"
+              f"  |  jerk(post-warmup): mean={jerk_post_warmup.mean():.2f} "
+              f"max={jerk_post_warmup.max():.2f} p90={np.percentile(jerk_post_warmup,90):.2f}")
+
+        if row["type"] == "failure" and row["drop_frame"]:
+            drop_frame = int(row["drop_frame"])
+            window_start = max(WARMUP_FRAMES, drop_frame - 15)
+            pre_drop_jerk = jerk[window_start:drop_frame]
+            if len(pre_drop_jerk) > 0:
+                print(f"           -> jerk in the 15 frames BEFORE drop (frame {window_start}-{drop_frame}): "
+                      f"mean={pre_drop_jerk.mean():.2f} max={pre_drop_jerk.max():.2f}")
     print()
 
     lead_times = []
@@ -208,6 +240,14 @@ def main():
 
         grip = grip_spread_series(traj)
         grip_alerts = sustained_rise_alerts(grip)
+
+        # Jerk is computed and printed above for calibration, but NOT yet
+        # combined into the alert decision below -- we need to see its
+        # real scale on this data first before picking a sensible
+        # z_threshold for it (its units/scale differ from the deviation
+        # z-score, so guessing a number here would be irresponsible).
+        # jerk = jerk_series(traj, fps)
+        # jerk_alerts = sustained_rise_alerts(jerk, z_threshold=???)
 
         combined = combine_alerts(dev_alerts, grip_alerts)
         alert_frame = first_true(combined)
